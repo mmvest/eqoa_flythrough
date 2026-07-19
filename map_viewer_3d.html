@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>EQOA 3D Flythrough</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: "Segoe UI", sans-serif; }
+  #view { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .panel { position: absolute; background: rgba(12, 15, 19, 0.85); color: #cfd8e3;
+           border: 1px solid #2b3642; border-radius: 8px; padding: 10px 12px; user-select: none; font-size: 12px; }
+  #worlds { top: 12px; left: 12px; display: flex; flex-direction: column; gap: 4px; }
+  #worlds button { background: #1b232c; color: #cfd8e3; border: 1px solid #2b3642; border-radius: 5px;
+                   padding: 5px 10px; cursor: pointer; text-align: left; font-size: 13px; }
+  #worlds button:hover { background: #24303c; }
+  #worlds button.active { background: #2f4a63; border-color: #4a7099; color: #fff; }
+  #settings { bottom: 12px; left: 12px; width: 240px; line-height: 1.7; }
+  #settings input[type=range] { width: 130px; vertical-align: middle; }
+  #settings label { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  #hud { top: 12px; right: 12px; text-align: right; line-height: 1.6; }
+  #help { bottom: 12px; right: 12px; line-height: 1.6; max-width: 240px; }
+  kbd { background: #232d38; border: 1px solid #3a4856; border-radius: 3px; padding: 0 5px; font-size: 11px; }
+  #loading { top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 14px; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="worlds" class="panel"></div>
+<div id="settings" class="panel">
+  <label title="Hour of the in-game day. Drives the sun angle, sunlight and ambient colors, fog and sky. Applies instantly.">Time of day <input id="tod" type="range" min="0" max="24" step="0.05" value="12"><span id="todv">12:00</span></label>
+  <label title="Animates the time of day continuously so you can watch sunrise and sunset.">Day cycle <input id="todanim" type="checkbox"></label>
+  <label title="Multiplies the game's fog/draw distance. x1 is the authentic PS2 view distance (fog from 250 to 800 units), higher values let you see much further than the game ever did. Applies instantly.">View distance <input id="viewdist" type="range" min="1" max="12" step="0.5" value="3"><span id="viewdistv">x3</span></label>
+  <label title="A warm light that follows the camera, imitating the game's personal light that keeps your surroundings visible at night and in dungeons. Applies instantly.">Lantern <input id="lantern" type="checkbox" checked></label>
+  <label title="The static light baked into the world data, like the orange glow around lava. Outdoor areas bake almost none, so this mostly matters in dungeons. Applies instantly.">Baked glow <input id="baked" type="checkbox" checked></label>
+  <label title="Camera speed in world units per second. The mouse wheel also adjusts it, Shift triples it.">Fly speed <input id="speed" type="range" min="0" max="4" step="0.1" value="2"><span id="speedv"></span></label>
+</div>
+<div id="hud" class="panel">
+  <div id="hud-world">-</div>
+  <div id="hud-coords">-</div>
+  <div id="hud-fps"></div>
+</div>
+<div id="help" class="panel">
+  <div><b>Click the view</b> to capture the mouse, <kbd>Esc</kbd> to release</div>
+  <div><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> fly, <kbd>Space</kbd>/<kbd>C</kbd> up/down</div>
+  <div><kbd>Shift</kbd> boost, wheel adjusts speed</div>
+</div>
+<div id="loading" class="panel">Pick a world to load</div>
+
+<script>
+"use strict";
+const WORLDS = [
+  { id: 0, name: "Tunaria",         file: "maps/tunaria_3d.js" },
+  { id: 1, name: "Rathe Mountains", file: "maps/rathe_3d.js" },
+  { id: 2, name: "Odus",            file: "maps/odus_3d.js" },
+  { id: 3, name: "Solusek's Eye",   file: "maps/lavastm_3d.js", dungeon: true },
+  { id: 4, name: "Plane of Sky",    file: "maps/planesky_3d.js" },
+  { id: 5, name: "Hidden Planes",   file: "maps/secrets_3d.js" },
+];
+
+// ---------------------------------------------------------------------------
+// Time-of-day tables from the engine (VIScene::InitTimeOfDay 0x466960).
+// 24 hourly entries: ambient rgb, sun rgb, sun direction angle = hour * 15deg
+// with dir (-sin a, cos a, 0), fog color initialized to the sun color.
+// Fog range from the default terrain profile (VIWorld::SetProfiles): 250..800.
+// ---------------------------------------------------------------------------
+const AMB = [];
+const SUN = [];
+{
+  const night = [0.294, 0.294, 0.392];
+  const ambDay = { 6: [0.333,0.333,0.333], 7: [0.333,0.333,0.333], 8: [0.373,0.373,0.373],
+                   9: [0.392,0.392,0.392], 10: [0.392,0.392,0.392], 11: [0.4,0.4,0.4],
+                   12: [0.4,0.4,0.4], 13: [0.392,0.392,0.392], 14: [0.392,0.392,0.392],
+                   15: [0.392,0.392,0.392], 16: [0.373,0.373,0.373] };
+  const sun = [
+    [0.2745,0,0.7451],[0.3137,0,0.8628],[0.3333,0,0.9412],[0.3529,0,1.0],
+    [0.4706,0.2157,0.9412],[0.6667,0.2157,0.9412],[1.0,0.6863,0.2157],[1.0,0.8235,0.392],
+    [1.0,0.9725,0.6275],[1.0,0.9804,0.7843],[1.0,0.9804,0.8235],[1.0,0.9804,0.902],
+    [1.0,0.9804,0.9412],[1.0,0.9804,0.902],[1.0,0.9804,0.7843],[1.0,0.9804,0.7843],
+    [1.0,0.9725,0.6275],[1.0,0.8235,0.392],[1.0,0.6863,0.2157],[0.6667,0.2157,0.9412],
+    [0.4706,0.2157,0.9412],[0.3529,0,1.0],[0.3333,0,0.9412],[0.3137,0,0.8628],
+  ];
+  for (let h = 0; h < 24; h++) {
+    AMB.push(ambDay[h] || night);
+    SUN.push(sun[h]);
+  }
+}
+const FOG_NEAR = 250, FOG_FAR = 800;
+
+function lerp3(a, b, t) { return [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t]; }
+function todSample(table, hour) {
+  const h0 = Math.floor(hour) % 24, h1 = (h0 + 1) % 24;
+  return lerp3(table[h0], table[h1], hour - Math.floor(hour));
+}
+function sunDir(hour) {
+  // light travel direction, straight down at noon (InitTimeOfDay: 15deg/hour)
+  const a = hour * 15 * Math.PI / 180;
+  return [-Math.sin(a), Math.cos(a), 0];
+}
+
+// ---------------------------------------------------------------------------
+// GL setup
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById("view");
+const gl = canvas.getContext("webgl2", { antialias: true });
+const loading = document.getElementById("loading");
+if (!gl) loading.textContent = "WebGL2 is not available in this browser.";
+const aniso = gl && (gl.getExtension("EXT_texture_filter_anisotropic"));
+
+const VS = `#version 300 es
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec2 aUV;
+layout(location=2) in vec3 aNormal;
+layout(location=3) in vec4 aColor;
+layout(location=4) in vec4 aM0;
+layout(location=5) in vec4 aM1;
+layout(location=6) in vec4 aM2;
+uniform mat4 uViewProj;
+uniform int uInstanced;
+out vec2 vUV;
+out vec3 vNormal;
+out vec4 vColor;
+out vec3 vWorld;
+void main() {
+  vec3 p = aPos, n = aNormal;
+  if (uInstanced == 1) {
+    p = vec3(dot(aM0, vec4(aPos, 1.0)), dot(aM1, vec4(aPos, 1.0)), dot(aM2, vec4(aPos, 1.0)));
+    n = vec3(dot(aM0.xyz, aNormal), dot(aM1.xyz, aNormal), dot(aM2.xyz, aNormal));
+  }
+  vWorld = p;
+  vUV = aUV;
+  vNormal = n;
+  vColor = aColor;
+  gl_Position = uViewProj * vec4(p, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+in vec2 vUV;
+in vec3 vNormal;
+in vec4 vColor;
+in vec3 vWorld;
+uniform sampler2DArray uTex0;
+uniform sampler2DArray uTex1;
+uniform float uLayer0; uniform float uLayer1;      // texture array layer index
+uniform vec4 uCol0; uniform vec4 uCol1;            // material layer colors 0..1
+uniform mat3 uUVMat0; uniform mat3 uUVMat1;
+uniform int uHasTex0; uniform int uHasLayer1; uniform int uBlend1;
+uniform int uAlphaTest;
+uniform vec3 uAmbient; uniform vec3 uSunColor; uniform vec3 uSunDir;
+uniform vec3 uCamPos; uniform vec3 uFogColor; uniform vec2 uFogRange;
+uniform int uBaked;
+uniform float uLantern;
+out vec4 fragColor;
+void main() {
+  vec2 uv0 = (uUVMat0 * vec3(vUV, 1.0)).xy;
+  vec4 t0 = uHasTex0 == 1 ? texture(uTex0, vec3(uv0, uLayer0)) : vec4(1.0);
+  if (uAlphaTest == 1 && t0.a < 0.25) discard;
+  vec3 base = t0.rgb * uCol0.rgb;
+  if (uHasLayer1 == 1) {
+    vec2 uv1 = (uUVMat1 * vec3(vUV, 1.0)).xy;
+    vec4 t1 = texture(uTex1, vec3(uv1, uLayer1));
+    // GS ALPHA per blend mode (VIMaterial::ConstructTextPass 0x42 switch):
+    // 1 add, 2 dest-src, 3 alpha blend, 4 dest*srcAlpha
+    vec3 src = t1.rgb * uCol1.rgb;
+    if (uBlend1 == 3) base = mix(base, src, t1.a);
+    else if (uBlend1 == 2) base -= src * t1.a;
+    else if (uBlend1 == 1) base += src * t1.a;
+    else if (uBlend1 == 4) base *= t1.a;
+    else if (t1.a >= 0.25) base = src;
+  }
+  // baked vertex color is an additive static light (lava glow etc), the
+  // engine default static lighting color is (0,0,0), outdoor bakes are ~0
+  vec3 vlight = uBaked == 1 ? vColor.rgb * 2.0 : vec3(0.0);
+  // time-of-day: ambient plus sun by normal (VIScene::SetupTimeOfDayLights)
+  vec3 n = normalize(vNormal);
+  vec3 tod = uAmbient + uSunColor * max(dot(n, -uSunDir), 0.0);
+  // personal light (VIScene::SetPersonalLight), warm falloff around the camera
+  float dcam = distance(vWorld, uCamPos);
+  float lfall = clamp(1.0 - dcam / 300.0, 0.0, 1.0);
+  vec3 lantern = vec3(1.0, 0.92, 0.75) * uLantern * lfall * lfall * 1.2;
+  vec3 lit = base * clamp(tod + vlight + lantern, 0.0, 1.3);
+  float fog = clamp((dcam - uFogRange.x) / (uFogRange.y - uFogRange.x), 0.0, 1.0);
+  fragColor = vec4(mix(lit, uFogColor, fog), t0.a * uCol0.a);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+let prog = null, U = {};
+if (gl) {
+  prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+    throw new Error(gl.getProgramInfoLog(prog));
+  for (const name of ["uViewProj","uInstanced","uTex0","uTex1","uLayer0","uLayer1",
+      "uCol0","uCol1","uUVMat0","uUVMat1","uHasTex0","uHasLayer1","uBlend1","uAlphaTest",
+      "uAmbient","uSunColor","uSunDir","uCamPos","uFogColor","uFogRange","uBaked","uLantern"])
+    U[name] = gl.getUniformLocation(prog, name);
+}
+
+// ---------------------------------------------------------------------------
+// World bundle loading
+// ---------------------------------------------------------------------------
+let world = null;          // { manifest, textures[], terrainVAO, meshVAO, ... }
+let pendingWorld = null;
+
+async function inflate(b64) {
+  const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const ds = new DecompressionStream("deflate");
+  const stream = new Blob([raw]).stream().pipeThrough(ds);
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function makeVAO(vb, ib) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, vb, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 28, 0);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 28, 12);
+  gl.enableVertexAttribArray(2);
+  gl.vertexAttribPointer(2, 3, gl.BYTE, true, 28, 20);
+  gl.enableVertexAttribArray(3);
+  gl.vertexAttribPointer(3, 4, gl.UNSIGNED_BYTE, true, 28, 24);
+  const ebo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, ib, gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  return vao;
+}
+
+function makeTexArray(g, data) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+  gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, g.w, g.h, g.count, 0,
+                gl.RGBA, gl.UNSIGNED_BYTE, data);
+  gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.REPEAT);
+  if (aniso) gl.texParameterf(gl.TEXTURE_2D_ARRAY, aniso.TEXTURE_MAX_ANISOTROPY_EXT, 4);
+  return tex;
+}
+
+// Bundles arrive as a manifest plus numbered parts. Each part is decoded,
+// uploaded to the GPU, and freed before the next one loads, so even Tunaria
+// never holds more than one ~20 MB slice in JS memory. Terrain chunks render
+// as soon as they arrive.
+let stash = {};   // sections waiting for their partner (tvbK/tibK, mesh trio)
+
+function initCamera(manifest) {
+  document.getElementById("hud-world").textContent = pendingWorld.name;
+  const b = manifest.bounds;
+  cam.pos = [(b.min[0]+b.max[0])/2, b.max[1] + 200, (b.min[2]+b.max[2])/2];
+  cam.yaw = 0; cam.pitch = -0.5;
+}
+
+// Single-file bundle (small worlds): whole payload in one deflated blob.
+window.WORLD3D_LOAD = async function(manifest, b64) {
+  loading.textContent = "Decompressing " + manifest.name + "...";
+  const blob = await inflate(b64);
+  const sec = name => {
+    const [off, len] = manifest.sections[name];
+    return blob.subarray(off, off + len);
+  };
+  const texArrays = [];
+  manifest.texGroups.forEach((g, i) => {
+    texArrays.push(makeTexArray(g, sec("tex" + i)));
+  });
+  const instBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, sec("inst"), gl.STATIC_DRAW);
+  world = {
+    manifest, texArrays,
+    terrainChunks: [{ vao: makeVAO(sec("terrain_vb"), sec("terrain_ib")),
+                      ranges: manifest.terrainRanges }],
+    meshVAO: makeVAO(sec("mesh_vb"), sec("mesh_ib")),
+    instBuf, meshesReady: true, name: pendingWorld.name,
+  };
+  initCamera(manifest);
+  loading.style.display = "none";
+  if (window.DEEPLINK) window.DEEPLINK();
+};
+
+// Parted bundle (Tunaria and other large worlds): manifest then .pN.js parts.
+window.WORLD3D_MANIFEST = function(manifest) {
+  world = { manifest, texArrays: [], terrainChunks: [], meshVAO: null,
+            instBuf: null, meshesReady: false, partsDone: 0,
+            name: pendingWorld.name };
+  stash = {};
+  initCamera(manifest);
+  if (window.DEEPLINK) window.DEEPLINK();
+  if (!manifest.inline) loadPart(0);   // inline bundles carry their own parts
+};
+
+function loadPart(i) {
+  const total = world.manifest.parts.length;
+  if (i >= total) {
+    loading.style.display = "none";
+    return;
+  }
+  loading.textContent = "Loading " + pendingWorld.name + " part " + (i + 1) + "/" + total;
+  const s = document.createElement("script");
+  s.src = pendingWorld.file.replace(/\.js$/, ".p" + i + ".js");
+  s.onerror = () => { loading.textContent = s.src.split("/").pop() + " not found."; };
+  s.onload = () => s.remove();
+  document.body.appendChild(s);
+}
+
+window.WORLD3D_PART = async function(idx, b64) {
+  const blob = await inflate(b64);
+  const sections = world.manifest.parts[idx];
+  for (const name of Object.keys(sections)) {
+    const [off, len] = sections[name];
+    stash[name] = blob.subarray(off, off + len);
+    handleSection(name);
+  }
+  world.partsDone++;
+  const total = world.manifest.parts.length;
+  if (world.partsDone >= total) {
+    loading.style.display = "none";
+  } else if (world.manifest.inline) {
+    loading.textContent = "Loading " + world.name + " " +
+      Math.round(world.partsDone * 100 / total) + "%";
+  } else {
+    loadPart(idx + 1);
+  }
+};
+
+function handleSection(name) {
+  const man = world.manifest;
+  let m;
+  if ((m = name.match(/^tex(\d+)$/))) {
+    world.texArrays[+m[1]] = makeTexArray(man.texGroups[+m[1]], stash[name]);
+    delete stash[name];
+  } else if ((m = name.match(/^t(vb|ib)(\d+)$/))) {
+    const k = +m[2];
+    if (stash["tvb" + k] && stash["tib" + k]) {
+      world.terrainChunks[k] = {
+        vao: makeVAO(stash["tvb" + k], stash["tib" + k]),
+        ranges: man.terrainChunks[k].ranges,
+      };
+      delete stash["tvb" + k];
+      delete stash["tib" + k];
+    }
+  } else if (name === "mesh_vb" || name === "mesh_ib" || name === "inst") {
+    if (stash.mesh_vb && stash.mesh_ib && stash.inst) {
+      world.meshVAO = makeVAO(stash.mesh_vb, stash.mesh_ib);
+      world.instBuf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, world.instBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, stash.inst, gl.STATIC_DRAW);
+      world.meshesReady = true;
+      delete stash.mesh_vb; delete stash.mesh_ib; delete stash.inst;
+    }
+  }
+}
+
+function loadWorld(w) {
+  pendingWorld = w;
+  world = null;
+  loading.style.display = "block";
+  loading.textContent = "Loading " + w.name + "...";
+  document.querySelectorAll("#worlds button").forEach(b =>
+    b.classList.toggle("active", b.dataset.id == w.id));
+  const s = document.createElement("script");
+  s.src = w.file;
+  s.onerror = () => { loading.textContent = w.file + " not found."; };
+  s.onload = () => s.remove();
+  document.body.appendChild(s);
+}
+
+const worldsPanel = document.getElementById("worlds");
+for (const w of WORLDS) {
+  const b = document.createElement("button");
+  b.textContent = w.name;
+  b.dataset.id = w.id;
+  b.onclick = () => loadWorld(w);
+  worldsPanel.appendChild(b);
+}
+
+// ---------------------------------------------------------------------------
+// Camera and input
+// ---------------------------------------------------------------------------
+const cam = { pos: [0, 200, 0], yaw: 0, pitch: -0.4 };
+const keys = {};
+let flySpeed = 2;   // log scale via slider
+
+canvas.addEventListener("click", () => canvas.requestPointerLock());
+window.addEventListener("mousemove", e => {
+  if (document.pointerLockElement !== canvas) return;
+  cam.yaw -= e.movementX * 0.0022;
+  cam.pitch -= e.movementY * 0.0022;
+  cam.pitch = Math.max(-1.55, Math.min(1.55, cam.pitch));
+});
+window.addEventListener("keydown", e => { keys[e.code] = true; });
+window.addEventListener("keyup", e => { keys[e.code] = false; });
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  const el = document.getElementById("speed");
+  el.value = Math.max(0, Math.min(4, parseFloat(el.value) - Math.sign(e.deltaY) * 0.2));
+}, { passive: false });
+
+function resize() {
+  canvas.width = window.innerWidth * devicePixelRatio;
+  canvas.height = window.innerHeight * devicePixelRatio;
+}
+window.addEventListener("resize", resize);
+resize();
+
+// ---------------------------------------------------------------------------
+// Matrices
+// ---------------------------------------------------------------------------
+function perspective(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+  return [f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0];
+}
+function mulMat(a, b) {
+  const o = new Array(16);
+  for (let c = 0; c < 4; c++)
+    for (let r = 0; r < 4; r++)
+      o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+  return o;
+}
+function viewMatrix() {
+  const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  // forward for yaw 0 looks toward -z
+  const fwd = [-sy * cp, sp, -cy * cp];
+  const right = [cy, 0, -sy];
+  const up = [sy * sp, cp, cy * sp];
+  const p = cam.pos;
+  return {
+    m: [right[0],up[0],-fwd[0],0, right[1],up[1],-fwd[1],0, right[2],up[2],-fwd[2],0,
+        -(right[0]*p[0]+right[1]*p[1]+right[2]*p[2]),
+        -(up[0]*p[0]+up[1]*p[1]+up[2]*p[2]),
+        (fwd[0]*p[0]+fwd[1]*p[1]+fwd[2]*p[2]), 1],
+    fwd, right,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Render loop
+// ---------------------------------------------------------------------------
+const el = id => document.getElementById(id);
+let lastTime = performance.now(), fpsTime = 0, fpsCount = 0;
+
+function setMaterialUniforms(mat, texArrays, translucentPass) {
+  const l0 = mat.layers[0];
+  const hasTex0 = l0.g >= 0 ? 1 : 0;
+  if (hasTex0) {
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, texArrays[l0.g]);
+  }
+  gl.uniform1i(U.uHasTex0, hasTex0);
+  gl.uniform1f(U.uLayer0, l0.l);
+  gl.uniform4f(U.uCol0, l0.c[0]/255, l0.c[1]/255, l0.c[2]/255, l0.c[3]/255);
+  gl.uniformMatrix3fv(U.uUVMat0, false, uvmat3(l0.m));
+  gl.uniform1i(U.uAlphaTest, (!translucentPass && l0.b === 0) ? 1 : 0);
+  const l1 = mat.layers[1];
+  if (l1 && l1.g >= 0) {
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, texArrays[l1.g]);
+    gl.uniform1i(U.uHasLayer1, 1);
+    gl.uniform1f(U.uLayer1, l1.l);
+    gl.uniform4f(U.uCol1, l1.c[0]/255, l1.c[1]/255, l1.c[2]/255, l1.c[3]/255);
+    gl.uniformMatrix3fv(U.uUVMat1, false, uvmat3(l1.m));
+    gl.uniform1i(U.uBlend1, l1.b);
+  } else {
+    gl.uniform1i(U.uHasLayer1, 0);
+  }
+  if (translucentPass) {
+    // engine modes: 1 add, 2 dest-src, 3 alpha, 4 dest*srcAlpha
+    if (l0.b === 1) gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+    else if (l0.b === 2) { gl.blendEquation(gl.FUNC_REVERSE_SUBTRACT); gl.blendFunc(gl.SRC_ALPHA, gl.ONE); }
+    else if (l0.b === 4) gl.blendFunc(gl.ZERO, gl.SRC_ALPHA);
+    else gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    if (l0.b !== 2) gl.blendEquation(gl.FUNC_ADD);
+  }
+}
+function uvmat3(m) {
+  return m ? [m[0],m[1],0, m[2],m[3],0, m[4],m[5],1] : [1,0,0, 0,1,0, 0,0,1];
+}
+
+function drawWorld(translucentPass) {
+  const man = world.manifest;
+  // terrain
+  gl.uniform1i(U.uInstanced, 0);
+  for (const chunk of world.terrainChunks) {
+    if (!chunk) continue;
+    gl.bindVertexArray(chunk.vao);
+    for (const rg of chunk.ranges) {
+      const mat = man.materials[rg.mat];
+      if (!mat || !!mat.translucent !== translucentPass) continue;
+      if (mat.layers[0].g >= 0 && !world.texArrays[mat.layers[0].g]) continue;
+      setMaterialUniforms(mat, world.texArrays, translucentPass);
+      gl.drawElements(gl.TRIANGLES, rg.count, gl.UNSIGNED_INT, rg.start * 4);
+    }
+  }
+  // instanced meshes
+  if (!world.meshesReady) { gl.bindVertexArray(null); return; }
+  gl.bindVertexArray(world.meshVAO);
+  gl.uniform1i(U.uInstanced, 1);
+  gl.bindBuffer(gl.ARRAY_BUFFER, world.instBuf);
+  for (const mesh of man.meshes) {
+    let any = false;
+    for (const rg of mesh.ranges)
+      if (!!man.materials[rg.mat].translucent === translucentPass) { any = true; break; }
+    if (!any) continue;
+    for (let i = 0; i < 3; i++) {
+      gl.enableVertexAttribArray(4 + i);
+      gl.vertexAttribPointer(4 + i, 4, gl.FLOAT, false, 48, mesh.instOff * 48 + i * 16);
+      gl.vertexAttribDivisor(4 + i, 1);
+    }
+    for (const rg of mesh.ranges) {
+      const mat = man.materials[rg.mat];
+      if (!!mat.translucent !== translucentPass) continue;
+      setMaterialUniforms(mat, world.texArrays, translucentPass);
+      gl.drawElementsInstanced(gl.TRIANGLES, rg.count, gl.UNSIGNED_INT,
+                               rg.start * 4, mesh.instCount);
+    }
+  }
+  gl.bindVertexArray(null);
+}
+
+function frame(now) {
+  const dt = Math.min(0.05, (now - lastTime) / 1000);
+  lastTime = now;
+
+  if (el("todanim").checked) {
+    el("tod").value = (parseFloat(el("tod").value) + dt * 0.25) % 24;
+  }
+  const hour = parseFloat(el("tod").value) % 24;
+  el("todv").textContent = String(Math.floor(hour)).padStart(2, "0") + ":" +
+    String(Math.floor((hour % 1) * 60)).padStart(2, "0");
+  const distMul = parseFloat(el("viewdist").value);
+  el("viewdistv").textContent = "x" + distMul;
+  flySpeed = Math.pow(10, parseFloat(el("speed").value));
+  el("speedv").textContent = Math.round(flySpeed) + " u/s";
+
+  // movement
+  const { m: view, fwd, right } = viewMatrix();
+  const boost = keys["ShiftLeft"] || keys["ShiftRight"] ? 3 : 1;
+  const v = flySpeed * boost * dt;
+  if (keys["KeyW"]) { cam.pos[0] += fwd[0]*v; cam.pos[1] += fwd[1]*v; cam.pos[2] += fwd[2]*v; }
+  if (keys["KeyS"]) { cam.pos[0] -= fwd[0]*v; cam.pos[1] -= fwd[1]*v; cam.pos[2] -= fwd[2]*v; }
+  if (keys["KeyD"]) { cam.pos[0] += right[0]*v; cam.pos[2] += right[2]*v; }
+  if (keys["KeyA"]) { cam.pos[0] -= right[0]*v; cam.pos[2] -= right[2]*v; }
+  if (keys["Space"]) cam.pos[1] += v;
+  if (keys["KeyC"]) cam.pos[1] -= v;
+
+  // time of day colors
+  let amb = todSample(AMB, hour);
+  let sun = todSample(SUN, hour);
+  const sdir = sunDir(hour);
+  // fog and sky share the hourly color (VIScene::SetupTimeOfDaySky)
+  const fogNear = FOG_NEAR * distMul, fogFar = FOG_FAR * distMul;
+  let fog = [sun[0] * 0.85, sun[1] * 0.85, sun[2] * 0.85];
+  if (pendingWorld && pendingWorld.dungeon) {
+    // indoor env: no sun, dim fixed ambient, near-black fog (SetupTimeOfDayFog)
+    sun = [0, 0, 0];
+    amb = [0.4, 0.4, 0.4];
+    fog = [0.03, 0.02, 0.02];
+  }
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(fog[0], fog[1], fog[2], 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  if (world) {
+    const proj = perspective(1.05, canvas.width / canvas.height, 1.0, fogFar * 1.5);
+    const vp = mulMat(proj, view);
+    gl.useProgram(prog);
+    gl.uniformMatrix4fv(U.uViewProj, false, vp);
+    gl.uniform1i(U.uTex0, 0);
+    gl.uniform1i(U.uTex1, 1);
+    gl.uniform3fv(U.uAmbient, amb);
+    gl.uniform3fv(U.uSunColor, sun);
+    gl.uniform3fv(U.uSunDir, sdir);
+    gl.uniform3fv(U.uCamPos, cam.pos);
+    gl.uniform3fv(U.uFogColor, fog);
+    gl.uniform2f(U.uFogRange, fogNear, fogFar);
+    gl.uniform1i(U.uBaked, el("baked").checked ? 1 : 0);
+    gl.uniform1f(U.uLantern, el("lantern").checked ? 1.0 : 0.0);
+
+    gl.enable(gl.DEPTH_TEST);
+    gl.disable(gl.CULL_FACE);       // PS2 strips are drawn double sided
+    gl.disable(gl.BLEND);
+    drawWorld(false);
+    gl.enable(gl.BLEND);
+    gl.depthMask(false);
+    drawWorld(true);
+    gl.depthMask(true);
+    gl.disable(gl.BLEND);
+    gl.blendEquation(gl.FUNC_ADD);
+
+    el("hud-coords").textContent =
+      "coords: " + cam.pos[0].toFixed(0) + ", " + cam.pos[2].toFixed(0) +
+      "  alt " + cam.pos[1].toFixed(0);
+  }
+
+  fpsCount++;
+  if (now - fpsTime > 500) {
+    el("hud-fps").textContent = Math.round(fpsCount * 1000 / (now - fpsTime)) + " fps";
+    fpsTime = now; fpsCount = 0;
+  }
+  requestAnimationFrame(frame);
+}
+// ?world=lavastm&x=..&y=..&z=..&yaw=..&pitch=..&hour=.. deep links a view
+const q = new URLSearchParams(location.search);
+if (q.get("hour")) el("tod").value = q.get("hour");
+if (gl && q.get("world")) {
+  const w = WORLDS.find(w => w.file.startsWith("maps/" + q.get("world")));
+  if (w) {
+    window.DEEPLINK = function() {
+      for (const [k, i] of [["x",0],["y",1],["z",2]])
+        if (q.get(k) !== null) cam.pos[i] = parseFloat(q.get(k));
+      if (q.get("yaw") !== null) cam.yaw = parseFloat(q.get("yaw"));
+      if (q.get("pitch") !== null) cam.pitch = parseFloat(q.get("pitch"));
+    };
+    loadWorld(w);
+  }
+}
+if (gl) requestAnimationFrame(frame);
+</script>
+</body>
+</html>
